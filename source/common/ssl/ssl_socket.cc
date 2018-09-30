@@ -12,10 +12,15 @@
 #include "openssl/err.h"
 #include "openssl/x509v3.h"
 
+#include <thread>
+
 using Envoy::Network::PostIoAction;
 
 namespace Envoy {
 namespace Ssl {
+
+// this_is_fine.jpg
+static thread_local SSL_SESSION *cached_session = nullptr;
 
 namespace {
 // This SslSocket will be used when SSL secret is not fetched from SDS server.
@@ -39,6 +44,10 @@ SslSocket::SslSocket(ContextSharedPtr ctx, InitialState state)
     : ctx_(std::dynamic_pointer_cast<ContextImpl>(ctx)), ssl_(ctx_->newSsl()) {
   if (state == InitialState::Client) {
     SSL_set_connect_state(ssl_.get());
+    // look up my callbacks_->connection->address in some threadlocal hashmap, if I get something, set session
+    if (cached_session != nullptr) {
+        SSL_set_session(ssl_.get(), cached_session);
+    }
   } else {
     ASSERT(state == InitialState::Server);
     SSL_set_accept_state(ssl_.get());
@@ -118,6 +127,14 @@ PostIoAction SslSocket::doHandshake() {
   int rc = SSL_do_handshake(ssl_.get());
   if (rc == 1) {
     ENVOY_CONN_LOG(debug, "handshake complete", callbacks_->connection());
+    // get1 significant (vs 'get'), need to incref so it does not get freed at ssl shutdown
+    SSL_SESSION *session = SSL_get1_session(ssl_.get());
+    // store session into thread local hash keyed on upstream host addr/port
+    cached_session = session;
+
+    int was_resumed = SSL_session_reused(ssl_.get());
+    ENVOY_CONN_LOG(info, "I got a session! resumed? {}", callbacks_->connection(), was_resumed);
+
     handshake_complete_ = true;
     ctx_->logHandshake(ssl_.get());
     callbacks_->raiseEvent(Network::ConnectionEvent::Connected);
